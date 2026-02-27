@@ -2123,10 +2123,7 @@ async function _loadUserData(authUser) {
   renderApp();
   const profile = await _fetchUserProfile(authUser);
   if (!profile) {
-    // RLS blocked or user not in public.users — treat as unauthenticated
-    await _supabase.auth.signOut();
-    AppState.user    = null;
-    AppState.case    = null;
+    console.error('User profile not found or blocked by RLS');
     AppState.loading = false;
     renderApp();
     return;
