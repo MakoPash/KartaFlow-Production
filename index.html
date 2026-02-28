@@ -2009,6 +2009,19 @@ footer {
 // ─── INIT LUCIDE ICONS ───
 document.addEventListener('DOMContentLoaded', () => { lucide.createIcons(); });
 
+// ─── BACKWARD COMPAT / STUBS ───
+// showPage: legacy alias for showAuthPage / goToLanding
+function showPage(page) {
+  if (page === 'landing') goToLanding();
+  else if (page === 'auth') showAuthPage('login');
+  else showAuthPage('login');
+}
+
+// startStripeCheckout: Stripe integration stub — backend required
+function startStripeCheckout() {
+  showToast('Payment checkout will be available once backend is connected.', 'info');
+}
+
 // ─── ANIMATED BACKGROUND ───
 (function() {
   const canvas = document.getElementById('bg-canvas');
@@ -2195,7 +2208,21 @@ async function _loadUserData(authUser) {
     }
     AppState.isPaidUser = AppState.user.paymentStatus === 'paid';
     AppState.profile = AppState.user; // keep .profile in sync for safety
+
+    // [ARCH: ROUTING — fetch case after login. If no case → questionnaire. If case exists → dashboard.]
     AppState.case = await _fetchCase(AppState.user);
+
+    // Hydrate questionnaire state from DB so returning users route correctly after page refresh.
+    // A case existing with status != questionnaire_pending means questionnaire was completed.
+    if (AppState.case && AppState.case.status && AppState.case.status !== 'questionnaire_pending') {
+      if (!AppState.questionnaire || !AppState.questionnaire.completed) {
+        AppState.questionnaire = { completed: true, aiRecommendation: null };
+      }
+    } else {
+      // No case or case is questionnaire_pending — questionnaire not yet completed
+      AppState.questionnaire = null;
+    }
+
     AppState.loading = false;
     renderApp();
   } catch (err) {
@@ -2279,16 +2306,24 @@ const API = {
   fetchMessages:       async () => Promise.resolve(null),
   bookCall:            async (slotId)      => Promise.resolve(null),
   submitQuestionnaire: async (responses) => {
+    // [ARCH: CASE CREATION — only runs on questionnaire submit. user_id always from auth. No status/tier/admin fields sent.]
     if (!AppState.user || !AppState.user.id) {
       console.error('[submitQuestionnaire] No authenticated user');
       return null;
     }
-    const userId = AppState.user.id;
 
-    // 1️⃣ Resolve caseId — create case if one does not yet exist for this user
+    // user_id MUST come from supabase.auth.getUser() — never from user input
+    const { data: { user: verifiedUser }, error: userVerifyError } = await _supabase.auth.getUser();
+    if (userVerifyError || !verifiedUser) {
+      console.error('[submitQuestionnaire] Could not verify user from auth:', userVerifyError);
+      await _supabase.auth.signOut();
+      return null;
+    }
+    const userId = verifiedUser.id;
+
+    // Step 1: Check if case already exists (prevent duplicates — unique constraint on user_id)
     let caseId = AppState.case ? AppState.case.id : null;
     if (!caseId) {
-      // Check for existing case first to avoid duplicates
       const { data: existingCase, error: fetchError } = await _supabase
         .from('cases')
         .select('id')
@@ -2296,6 +2331,7 @@ const API = {
         .maybeSingle();
 
       if (fetchError) {
+        console.error('[submitQuestionnaire] Error checking for existing case:', fetchError);
         const isAuthError = fetchError.status === 401 || fetchError.status === 403 ||
           (fetchError.message && (
             fetchError.message.toLowerCase().includes('jwt') ||
@@ -2307,12 +2343,19 @@ const API = {
       }
 
       if (existingCase) {
+        // Case already exists — do NOT create another
         caseId = existingCase.id;
       } else {
-        // No case exists — create one now with status questionnaire_complete
+        // No case → create now. Only send user_id and permit_type. Let DB defaults handle everything else.
+        // DO NOT send: status, tier, review_cycles_used, sla_deadline, lawyer_id, payment fields
+        const selectedPermit = responses.primary_reason || null;
         const { data: newCase, error: caseInsertError } = await _supabase
           .from('cases')
-          .insert({ user_id: userId, status: 'questionnaire_complete' })
+          .insert({
+            user_id:               userId,
+            permit_type:           selectedPermit,
+            permit_type_confirmed: true
+          })
           .select()
           .single();
 
@@ -2331,19 +2374,20 @@ const API = {
       }
     }
 
-    // 2️⃣ Insert questionnaire response row
+    // Step 2: Insert questionnaire response row
     const { data, error: insertError } = await _supabase
       .from('questionnaire_responses')
       .insert({
-        case_id: caseId,
+        case_id:   caseId,
         responses: responses
       })
       .select()
       .single();
-    // 3️⃣ Handle errors: treat duplicate (23505) as success; sign out only on auth/session errors
+
+    // Step 3: Handle errors — treat duplicate (23505) as success; sign out only on auth/session errors
     if (insertError) {
       if (insertError.code === '23505') {
-        // Duplicate — treat as success, continue to status update
+        // Duplicate response — acceptable, treat as success
       } else {
         const isAuthError = insertError.status === 401 || insertError.status === 403 ||
           (insertError.message && (
@@ -2353,16 +2397,20 @@ const API = {
           ));
         if (isAuthError) {
           await _supabase.auth.signOut();
+        } else {
+          console.error('[submitQuestionnaire] Failed to insert questionnaire response:', insertError);
         }
         return null;
       }
     }
-    // 4️⃣ Update case status via RPC (awaited)
+
+    // Step 4: Update case status via RPC
     const { error: rpcError } = await _supabase.rpc('update_case_status', {
-      p_case_id: caseId,
+      p_case_id:    caseId,
       p_new_status: 'questionnaire_complete'
     });
     if (rpcError) {
+      console.error('[submitQuestionnaire] RPC update_case_status failed:', rpcError);
       const isPermissionError = rpcError.status === 401 || rpcError.status === 403 ||
         (rpcError.message && (
           rpcError.message.toLowerCase().includes('permission') ||
@@ -2581,50 +2629,64 @@ function switchAuthTab(tab, btn) {
 }
 
 async function handleLogin() {
+  // [ARCH: LOGIN — only calls signInWithPassword. No case creation. Routing handled by onAuthStateChange → _loadUserData → renderApp]
   const email = document.getElementById('login-email').value.trim();
   const pass  = document.getElementById('login-password').value;
   if (!email || !pass) { showToast('Please enter your email and password', 'error'); return; }
-  showToast('Signing in…', 'info');
-  AppState.loading = true;
-  renderApp();
-  const { data, error } = await _supabase.auth.signInWithPassword({ email, password: pass });
-  if (error || !data.user) {
-    AppState.loading = false;
-    renderApp();
-    showToast('Invalid email or password. Please try again.', 'error');
-    return;
+
+  const btn = document.querySelector('#auth-login .btn-primary');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader-2" style="width:16px;height:16px"></i> Signing in…'; lucide.createIcons(); }
+
+  try {
+    const { data, error } = await _supabase.auth.signInWithPassword({ email, password: pass });
+    if (error || !data.user) {
+      showToast(error ? error.message || 'Invalid email or password.' : 'Sign in failed.', 'error');
+      return;
+    }
+    // onAuthStateChange SIGNED_IN fires → _loadUserData → renderApp
+  } catch (err) {
+    console.error('[handleLogin] Unexpected error:', err);
+    showToast('An unexpected error occurred. Please try again.', 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="log-in" style="width:16px;height:16px"></i> Sign in'; lucide.createIcons(); }
   }
-  // onAuthStateChange will handle the rest
 }
 
 async function handleRegister() {
+  // [ARCH: SIGNUP — only calls supabase.auth.signUp. NO case creation. NO case insert. NO status reference.]
   const first = document.getElementById('reg-first').value.trim();
   const last  = document.getElementById('reg-last').value.trim();
   const email = document.getElementById('reg-email').value.trim();
   const pass  = document.getElementById('reg-password').value;
   if (!first || !last || !email || !pass) { showToast('Please fill in all required fields', 'error'); return; }
   if (pass.length < 8) { showToast('Password must be at least 8 characters', 'error'); return; }
-  AppState.loading = true;
-  renderApp();
-  const { data, error } = await _supabase.auth.signUp({
-    email,
-    password: pass,
-    options: { data: { first_name: first, last_name: last } }
-  });
-  if (error) {
-    AppState.loading = false;
-    renderApp();
-    showToast(error.message || 'Registration failed. Please try again.', 'error');
-    return;
+
+  const btn = document.querySelector('#auth-register .btn-primary');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader-2" style="width:16px;height:16px"></i> Creating account…'; lucide.createIcons(); }
+
+  try {
+    const { data, error } = await _supabase.auth.signUp({
+      email,
+      password: pass,
+      options: { data: { first_name: first, last_name: last } }
+    });
+    if (error) {
+      showToast(error.message || 'Registration failed. Please try again.', 'error');
+      return;
+    }
+    if (data.user && !data.session) {
+      // Email confirmation required — do NOT create case here
+      showToast('Account created — please check your email to confirm your address.', 'success');
+      return;
+    }
+    // Session auto-confirmed: onAuthStateChange SIGNED_IN fires → _loadUserData → renderApp
+    // Case will only be created after questionnaire submission
+  } catch (err) {
+    console.error('[handleRegister] Unexpected error:', err);
+    showToast('An unexpected error occurred. Please try again.', 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="user-plus" style="width:16px;height:16px"></i> Create account'; lucide.createIcons(); }
   }
-  if (data.user && !data.session) {
-    // Email confirmation required
-    AppState.loading = false;
-    renderApp();
-    showToast('Account created — please check your email to confirm your address.', 'success');
-    return;
-  }
-  // onAuthStateChange handles the rest if auto-confirmed
 }
 
 async function handleLogout() {
@@ -2633,8 +2695,12 @@ async function handleLogout() {
   showToast('Signed out successfully', 'success');
 }
 
-// ─── QUESTIONNAIRE SUBMIT ───
+// [ARCH: QUESTIONNAIRE SUBMIT — creates case only here if one does not exist. user_id from auth.getUser(). No status/tier/admin fields.]
+let _isSubmittingQuestionnaire = false;
+
 async function handleQuestionnaireSubmit() {
+  if (_isSubmittingQuestionnaire) return; // prevent double-submit
+
   const fields = {
     primary_reason:     document.getElementById('q_primary_reason')?.value    || '',
     nationality:        document.getElementById('q_nationality')?.value        || '',
@@ -2655,8 +2721,10 @@ async function handleQuestionnaireSubmit() {
       return;
     }
   }
+
   const btn = document.getElementById('questionnaire-submit-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader-2"></i> Submitting…'; lucide.createIcons(); }
+  _isSubmittingQuestionnaire = true;
 
   // Compute client-side TRC recommendation based on responses
   function _computeTrcRecommendation(f) {
@@ -2670,34 +2738,33 @@ async function handleQuestionnaireSubmit() {
   const trcRecommendation = _computeTrcRecommendation(fields);
 
   try {
-    // Allow re-editing: if case is already questionnaire_complete or further, skip API call and just update locally
+    // Re-edit mode: if case already exists and is past questionnaire_pending, skip DB re-insert
     const caseStatus = AppState.case ? AppState.case.status : null;
-    console.log('[handleQuestionnaireSubmit] Current case status:', caseStatus);
-    if (caseStatus === 'questionnaire_complete' || caseStatus === 'call_pending' ||
-        caseStatus === 'call_confirmed' || caseStatus === 'documents_pending') {
-      // Re-edit mode: save locally, no DB re-insert needed
+    if (caseStatus && caseStatus !== 'questionnaire_pending') {
+      // Already submitted — update local state only
       AppState.questionnaire = { completed: true, aiRecommendation: trcRecommendation };
       showToast('Questionnaire updated.', 'success');
-      safeActivatePage('page-book-call');
+      renderApp(); // let router decide correct next page
       return;
     }
-    console.log('[handleQuestionnaireSubmit] Calling API.submitQuestionnaire...');
+
     const result = await API.submitQuestionnaire(fields);
-    console.log('[handleQuestionnaireSubmit] API result:', result);
     if (!result) throw new Error('submit_failed');
+
     // Re-fetch case after submission
     AppState.case = await _fetchCase(AppState.user);
-    console.log('[handleQuestionnaireSubmit] Refetched case:', AppState.case);
-    // Update local state before routing
-    AppState.questionnaire = { ...AppState.questionnaire, completed: true, aiRecommendation: trcRecommendation };
+    // Update local questionnaire state
+    AppState.questionnaire = { completed: true, aiRecommendation: trcRecommendation };
     showToast('Questionnaire submitted! Here is your suggested TRC type.', 'success');
-    safeActivatePage('page-book-call');
+    renderApp(); // let router decide correct next page
   } catch (err) {
     console.error('[handleQuestionnaireSubmit] Submission error:', err);
-    // Re-enable submit button on non-auth errors; skip if user was signed out
-    if (!AppState.user) return; // auth sign-out in progress; do not re-enable
+    if (!AppState.user) return; // auth sign-out in progress
     if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="send"></i> Submit questionnaire'; lucide.createIcons(); }
     showToast('Submission failed. Please try again.', 'error');
+  } finally {
+    _isSubmittingQuestionnaire = false;
+    if (btn && !btn.disabled) { btn.disabled = false; }
   }
 }
 
@@ -2889,10 +2956,10 @@ async function submitCaseForReview() {
   const btn = document.getElementById('submit-review-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader" style="width:16px;height:16px"></i> Submitting…'; lucide.createIcons(); }
   try {
-    const { data, error } = await supabase.rpc('submit_case_for_review', { p_case_id: AppState.case.id });
+    const { data, error } = await _supabase.rpc('submit_case_for_review', { p_case_id: AppState.case.id });
     if (error) {
       if (error.message && error.message.toLowerCase().includes('auth')) {
-        await supabase.auth.signOut();
+        await _supabase.auth.signOut();
         return;
       }
       throw error;
@@ -2911,7 +2978,7 @@ async function resubmitCaseForReview() {
   const btn = document.getElementById('resubmit-review-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader" style="width:16px;height:16px"></i> Submitting…'; lucide.createIcons(); }
   try {
-    const { data, error } = await supabase.rpc('submit_case_for_review', { p_case_id: AppState.case.id });
+    const { data, error } = await _supabase.rpc('submit_case_for_review', { p_case_id: AppState.case.id });
     if (error) {
       const isAuthError = error.status === 401 || error.status === 403 ||
         (error.message && (
@@ -2920,7 +2987,7 @@ async function resubmitCaseForReview() {
           error.message.toLowerCase().includes('permission')
         ));
       if (isAuthError) {
-        await supabase.auth.signOut();
+        await _supabase.auth.signOut();
         return;
       }
       if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="send" style="width:16px;height:16px"></i> Resubmit for Review'; lucide.createIcons(); }
@@ -3549,7 +3616,7 @@ async function _specialistCaseAction(newStatus, btnIds) {
   btns.forEach(b => { b.disabled = true; b.style.opacity = '0.6'; });
 
   try {
-    const { error } = await supabase.rpc('update_case_status', {
+    const { error } = await _supabase.rpc('update_case_status', {
       p_case_id: c.id,
       p_new_status: newStatus
     });
@@ -3557,7 +3624,7 @@ async function _specialistCaseAction(newStatus, btnIds) {
     if (error) throw error;
 
     // Re-fetch case and update AppState
-    const { data: updated, error: fetchErr } = await supabase
+    const { data: updated, error: fetchErr } = await _supabase
       .from('cases')
       .select('*')
       .eq('id', c.id)
@@ -3574,12 +3641,11 @@ async function _specialistCaseAction(newStatus, btnIds) {
     }
 
     _renderSpecialistCaseDetail();
+    showToast('Case status updated.', 'success');
   } catch (err) {
-    // Silently sign out on error — same pattern used elsewhere
-    await supabase.auth.signOut();
-    AppState.user = null;
-    AppState.profile = null;
-    showPage('auth');
+    console.error('[_specialistCaseAction] Error:', err);
+    btns.forEach(b => { b.disabled = false; b.style.opacity = ''; });
+    showToast('Action failed. Please try again.', 'error');
   }
 }
 
