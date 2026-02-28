@@ -1964,6 +1964,34 @@ footer {
 </div>
 
 <!-- ════════════════════════════
+     UPGRADE MODAL
+════════════════════════════ -->
+<div class="modal-overlay" id="upgrade-modal">
+  <div class="modal">
+    <button class="modal-close" onclick="closeUpgradeModal()">
+      <i data-lucide="x"></i>
+    </button>
+
+    <div style="text-align:center">
+      <div style="margin-bottom:12px;font-weight:700;font-size:20px">
+        Activate Your Application
+      </div>
+      <div style="font-size:14px;color:var(--text-2);margin-bottom:24px">
+        Get lawyer review, document validation, and guided submission.
+      </div>
+
+      <button class="btn btn-primary btn-full btn-lg" onclick="startStripeCheckout()">
+        Continue to Payment
+      </button>
+
+      <div style="margin-top:12px;font-size:12px;color:var(--text-3)">
+        Secure payment · EU servers · Lawyer engagement included
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════
      JAVASCRIPT
 ════════════════════════════ -->
 <script>
@@ -2040,6 +2068,23 @@ const AppState = {
   specialistCases: [],  // [{ id, status, created_at, user_id }]
   selectedCase: null    // selected case for detail view
 };
+
+// ─── SOFT PAYWALL HELPERS ───
+function guardPremiumAction(actionFn) {
+  if (!AppState.isPaidUser) {
+    openUpgradeModal();
+    return;
+  }
+  actionFn();
+}
+
+function openUpgradeModal() {
+  document.getElementById('upgrade-modal').classList.add('open');
+}
+
+function closeUpgradeModal() {
+  document.getElementById('upgrade-modal').classList.remove('open');
+}
 
 // ─── CANONICAL SYSTEM STATES ───
 // Must match kartaflow-master-v1.2 exactly.
@@ -2129,6 +2174,7 @@ async function _loadUserData(authUser) {
     return;
   }
   AppState.user = profile;
+  AppState.isPaidUser = profile.paymentStatus === 'paid';
   AppState.case = await _fetchCase(profile);
   AppState.loading = false;
   renderApp();
@@ -2302,12 +2348,6 @@ function renderApp() {
   }
 
   // ── Client state machine ──
-  // Gate 1: payment
-  if (user.paymentStatus !== 'paid') {
-    _showRawPage('plan-selection');
-    return;
-  }
-
   // Gate 2: questionnaire
   if (!questionnaire || !questionnaire.completed) {
     _showRawPage('questionnaire');
@@ -2573,6 +2613,24 @@ function renderClientOverview() {
       <span class="badge ${badgeClass}"><i data-lucide="clock" style="width:11px;height:11px"></i> ${statusLabel}</span>
     </div>
 
+    ${!AppState.isPaidUser ? `
+    <div class="card" style="margin-bottom:20px;border:1px solid rgba(232,19,42,0.25);background:rgba(232,19,42,0.04)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+        <div>
+          <div style="font-weight:700;font-size:15px;margin-bottom:4px">
+            Unlock your full application support
+          </div>
+          <div style="font-size:13px;color:var(--text-2)">
+            Upgrade to activate document uploads, lawyer review, and submission.
+          </div>
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="openUpgradeModal()">
+          Upgrade now
+        </button>
+      </div>
+    </div>
+    ` : ''}
+
     <div class="stats-grid" style="margin-bottom:20px">
       <div class="stat-card">
         <div class="stat-label">Documents</div>
@@ -2605,7 +2663,7 @@ function renderClientOverview() {
         <label class="form-label" for="vc-datetime">Select date &amp; time</label>
         <input type="datetime-local" id="vc-datetime" class="form-input">
       </div>
-      <button class="btn btn-primary" id="vc-book-btn" onclick="handleBookVideoCall()">
+      <button class="btn btn-primary" id="vc-book-btn" onclick="guardPremiumAction(handleBookVideoCall)">
         <i data-lucide="calendar"></i> Book Consultation
       </button>
     </div>` : ''}
@@ -2616,7 +2674,7 @@ function renderClientOverview() {
         <i data-lucide="send" style="width:17px;height:17px;color:var(--red)"></i> Submit Your Case
       </div>
       <div style="font-size:13px;color:var(--text-2);margin-bottom:18px">Once submitted, your specialist will begin full review.</div>
-      <button class="btn btn-primary" id="submit-review-btn" onclick="submitCaseForReview()">
+      <button class="btn btn-primary" id="submit-review-btn" onclick="guardPremiumAction(submitCaseForReview)">
         <i data-lucide="send"></i> Submit for Review
       </button>
     </div>` : ''}
@@ -2782,7 +2840,7 @@ function renderClientDocuments() {
     <div class="dash-topbar">
       <div><div class="dash-page-title">My Documents</div>
         <div class="dash-page-sub">No documents yet</div></div>
-      ${canUpload ? '<button class="btn btn-primary btn-sm" onclick="openUploadModal()"><i data-lucide="upload-cloud"></i> Upload document</button>' : ''}
+      ${canUpload ? '<button class="btn btn-primary btn-sm" onclick="guardPremiumAction(openUploadModal)"><i data-lucide="upload-cloud"></i> Upload document</button>' : ''}
     </div>
     ${revisionCard}
     <div class="card" style="text-align:center;padding:48px 24px">
@@ -2797,7 +2855,7 @@ function renderClientDocuments() {
     <div class="dash-topbar">
       <div><div class="dash-page-title">My Documents</div>
         <div class="dash-page-sub">${verified.length} of ${docs.length} documents verified</div></div>
-      ${canUpload ? '<button class="btn btn-primary btn-sm" onclick="openUploadModal()"><i data-lucide="upload-cloud"></i> Upload document</button>' : ''}
+      ${canUpload ? '<button class="btn btn-primary btn-sm" onclick="guardPremiumAction(openUploadModal)"><i data-lucide="upload-cloud"></i> Upload document</button>' : ''}
     </div>
     ${revisionCard}
     ${verified.length ? `<div class="card" style="margin-bottom:16px">
@@ -2851,7 +2909,7 @@ function renderClientMessages() {
       </div>` : `<div style="font-size:13px;color:var(--text-3);padding:32px;text-align:center">No messages yet. Your specialist will contact you here.</div>`}
       <div style="display:flex;gap:10px">
         <input type="text" class="form-input" placeholder="Write a message…" id="msg-input" style="flex:1">
-        <button class="btn btn-primary" onclick="sendMessage()"><i data-lucide="send"></i></button>
+        <button class="btn btn-primary" onclick="guardPremiumAction(sendMessage)"><i data-lucide="send"></i></button>
       </div>
     </div>`;
 }
