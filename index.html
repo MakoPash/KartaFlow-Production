@@ -1819,11 +1819,16 @@ footer {
         Karta<span style="color:var(--red)">Flow</span>
       </div>
       <div style="font-size:15px;color:var(--text-2);margin-bottom:32px;text-align:center">TRC Type Questionnaire</div>
+      <div id="questionnaire-back-btn-wrap" style="display:none;margin-bottom:16px;text-align:center">
+        <button class="btn btn-ghost btn-sm" onclick="renderApp()" style="color:var(--text-3)">
+          <i data-lucide="arrow-left"></i> Back to dashboard
+        </button>
+      </div>
       <div class="card" style="padding:36px">
         <div style="display:flex;align-items:center;gap:12px;margin-bottom:24px;padding-bottom:20px;border-bottom:1px solid var(--border)">
           <i data-lucide="clipboard-list" style="width:28px;height:28px;color:var(--red);flex-shrink:0"></i>
           <div>
-            <div style="font-size:16px;font-weight:700;margin-bottom:2px">Determine your TRC type</div>
+            <div id="questionnaire-mode-label" style="font-size:16px;font-weight:700;margin-bottom:2px">Determine your TRC type</div>
             <div style="font-size:13px;color:var(--text-3)">Answer all questions honestly — your specialist will review your case.</div>
           </div>
         </div>
@@ -2343,17 +2348,17 @@ function canAccessRoute(routeName) {
   if (role === 'specialist') return routeName === 'specialist';
   if (role === 'admin')      return routeName === 'admin';
 
-  // Client gate: payment required
-  if (paymentStatus !== 'paid') return routeName === 'plan-selection';
+  // Client gate: payment required — REMOVED (soft paywall via guardPremiumAction)
+  // Unpaid users can access questionnaire and dashboard; premium actions are gated individually.
 
   // Client gate: questionnaire required
   if (!questionnaire || !questionnaire.completed) return routeName === 'questionnaire';
 
-  // Client gate: confirmation call required
-  if (!videoCall || videoCall.status !== 'completed') return routeName === 'book-call';
+  // Client gate: confirmation call required (paid users only)
+  if (AppState.isPaidUser && (!videoCall || videoCall.status !== 'completed')) return routeName === 'book-call';
 
-  // Full client dashboard
-  return routeName === 'client';
+  // Full client dashboard (also accessible to unpaid users after questionnaire)
+  return routeName === 'client' || routeName === 'questionnaire';
 }
 
 // ─── SAFE PAGE ACTIVATION HELPER ───
@@ -2408,22 +2413,18 @@ function renderApp() {
     }
 
     // ── Client state machine ──
-    const resolvedPaymentStatus = AppState.profile?.payment_status || "unpaid";
 
-    // Gate 1: payment
-    if (resolvedPaymentStatus !== 'paid') {
-      safeActivatePage("page-plan-selection");
-      return;
-    }
+    // Gate 1 (REMOVED): unpaid users are no longer hard-redirected to page-plan-selection.
+    // Soft paywall is enforced per-action via guardPremiumAction().
 
-    // Gate 2: questionnaire
+    // Gate 2: questionnaire — must complete before reaching dashboard
     if (!questionnaire || !questionnaire.completed) {
       safeActivatePage("page-questionnaire");
       return;
     }
 
-    // Gate 3: confirmation call
-    if (!videoCall || videoCall.status !== 'completed') {
+    // Gate 3: confirmation call — only block if user is paid AND call not completed
+    if (AppState.isPaidUser && (!videoCall || videoCall.status !== 'completed')) {
       safeActivatePage("page-book-call");
       return;
     }
@@ -2436,8 +2437,10 @@ function renderApp() {
     switch (status) {
       case 'questionnaire_pending':
       case 'questionnaire_complete':
+        renderClientDashboard('overview');
+        break;
       case 'call_pending':
-        renderClientDashboard('booking');
+        renderClientDashboard(AppState.isPaidUser ? 'booking' : 'overview');
         break;
       case 'call_confirmed':
       case 'documents_pending':
@@ -2613,15 +2616,38 @@ async function handleQuestionnaireSubmit() {
   }
   const btn = document.getElementById('questionnaire-submit-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = '<i data-lucide="loader-2"></i> Submitting…'; lucide.createIcons(); }
+
+  // Compute client-side TRC recommendation based on responses
+  function _computeTrcRecommendation(f) {
+    if (f.student_status === 'yes_full_time' || f.student_status === 'yes_phd') return 'TRC for Study (Nauka)';
+    if (f.family_ties === 'yes_spouse_polish') return 'TRC for Family Reunification (Rodzina)';
+    if (f.primary_reason === 'family_reunion') return 'TRC for Family Reunification (Rodzina)';
+    if (f.primary_reason === 'work_b2b') return 'TRC for Self-Employment (Działalność)';
+    if (f.primary_reason === 'work_employment') return 'TRC for Employment (Praca)';
+    return 'TRC — Temporary Residence';
+  }
+  const trcRecommendation = _computeTrcRecommendation(fields);
+
   try {
+    // Allow re-editing: if case is already questionnaire_complete, skip API call and just update locally
+    const caseStatus = AppState.case ? AppState.case.status : null;
+    if (caseStatus === 'questionnaire_complete' || caseStatus === 'call_pending' ||
+        caseStatus === 'call_confirmed' || caseStatus === 'documents_pending') {
+      // Re-edit mode: save locally, no DB re-insert needed
+      AppState.questionnaire = { completed: true, aiRecommendation: trcRecommendation };
+      showToast('Questionnaire updated.', 'success');
+      renderApp();
+      return;
+    }
     const result = await API.submitQuestionnaire(fields);
     if (!result) throw new Error('submit_failed');
-    // 5️⃣ Await case re-fetch
+    // Re-fetch case after submission
     AppState.case = await _fetchCase(AppState.user);
-    AppState.questionnaire = { completed: true };
+    AppState.questionnaire = { completed: true, aiRecommendation: trcRecommendation };
+    showToast('Questionnaire submitted! Here is your suggested TRC type.', 'success');
     renderApp();
   } catch (err) {
-    // 5️⃣ Re-enable submit button on non-auth errors; skip if user was signed out
+    // Re-enable submit button on non-auth errors; skip if user was signed out
     if (!AppState.user) return; // auth sign-out in progress; do not re-enable
     if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="send"></i> Submit questionnaire'; lucide.createIcons(); }
     showToast('Submission failed. Please try again.', 'error');
@@ -2633,6 +2659,18 @@ function clientNav(section, btn) {
   document.querySelectorAll('#page-client .dash-nav-item').forEach(b => b.classList.remove('active'));
   if (btn) btn.classList.add('active');
   renderClientSection(section);
+}
+
+function openEditQuestionnaire() {
+  safeActivatePage('page-questionnaire');
+  // Show back button since user is editing from dashboard
+  const backWrap = document.getElementById('questionnaire-back-btn-wrap');
+  if (backWrap) backWrap.style.display = 'block';
+  const modeLabel = document.getElementById('questionnaire-mode-label');
+  if (modeLabel && AppState.questionnaire && AppState.questionnaire.completed) {
+    modeLabel.textContent = 'Edit your TRC questionnaire';
+  }
+  lucide.createIcons();
 }
 
 function renderClientDashboard(section) { renderClientSection(section || 'overview'); }
@@ -2684,6 +2722,36 @@ function renderClientOverview() {
       </div>
       <span class="badge ${badgeClass}"><i data-lucide="clock" style="width:11px;height:11px"></i> ${statusLabel}</span>
     </div>
+
+    ${AppState.questionnaire && AppState.questionnaire.aiRecommendation ? `
+    <div class="card" style="margin-bottom:16px;border:1px solid rgba(22,163,74,0.25);background:rgba(22,163,74,0.04)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:12px">
+          <div style="width:36px;height:36px;border-radius:50%;background:rgba(22,163,74,0.1);display:flex;align-items:center;justify-content:center;flex-shrink:0">
+            <i data-lucide="check-circle" style="width:18px;height:18px;color:#16A34A"></i>
+          </div>
+          <div>
+            <div style="font-size:12px;font-weight:600;color:#16A34A;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:2px">Suggested TRC Application</div>
+            <div style="font-size:16px;font-weight:700;color:var(--text)">${AppState.questionnaire.aiRecommendation}</div>
+            <div style="font-size:12px;color:var(--text-3);margin-top:2px">Based on your questionnaire — your specialist will confirm</div>
+          </div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="openEditQuestionnaire()" style="white-space:nowrap">
+          <i data-lucide="edit-3"></i> Edit questionnaire
+        </button>
+      </div>
+    </div>` : `
+    <div class="card" style="margin-bottom:16px;border:1px solid rgba(232,19,42,0.2);background:rgba(232,19,42,0.03)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+        <div>
+          <div style="font-size:14px;font-weight:600;margin-bottom:2px">Complete your questionnaire</div>
+          <div style="font-size:13px;color:var(--text-2)">Help us determine the right TRC type for your situation.</div>
+        </div>
+        <button class="btn btn-primary btn-sm" onclick="openEditQuestionnaire()">
+          <i data-lucide="clipboard-list"></i> Start questionnaire
+        </button>
+      </div>
+    </div>`}
 
     ${!AppState.isPaidUser ? `
     <div class="card" style="margin-bottom:20px;border:1px solid rgba(232,19,42,0.25);background:rgba(232,19,42,0.04)">
