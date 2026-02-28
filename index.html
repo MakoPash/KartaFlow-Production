@@ -2643,10 +2643,12 @@ async function handleQuestionnaireSubmit() {
     if (!result) throw new Error('submit_failed');
     // Re-fetch case after submission
     AppState.case = await _fetchCase(AppState.user);
-    AppState.questionnaire = { completed: true, aiRecommendation: trcRecommendation };
+    // Update local state before routing runs
+    AppState.questionnaire = { ...AppState.questionnaire, completed: true, aiRecommendation: trcRecommendation };
     showToast('Questionnaire submitted! Here is your suggested TRC type.', 'success');
     renderApp();
   } catch (err) {
+    console.error('[handleQuestionnaireSubmit] Submission error:', err);
     // Re-enable submit button on non-auth errors; skip if user was signed out
     if (!AppState.user) return; // auth sign-out in progress; do not re-enable
     if (btn) { btn.disabled = false; btn.innerHTML = '<i data-lucide="send"></i> Submit questionnaire'; lucide.createIcons(); }
