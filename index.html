@@ -2279,13 +2279,59 @@ const API = {
   fetchMessages:       async () => Promise.resolve(null),
   bookCall:            async (slotId)      => Promise.resolve(null),
   submitQuestionnaire: async (responses) => {
-    if (!AppState.case) {
-      console.error('[submitQuestionnaire] Missing case in AppState');
+    if (!AppState.user || !AppState.user.id) {
+      console.error('[submitQuestionnaire] No authenticated user');
       return null;
     }
-    const caseId = AppState.case.id;
-    if (!caseId) return null;
-    // 2️⃣ Insert questionnaire response row, capturing returned data
+    const userId = AppState.user.id;
+
+    // 1️⃣ Resolve caseId — create case if one does not yet exist for this user
+    let caseId = AppState.case ? AppState.case.id : null;
+    if (!caseId) {
+      // Check for existing case first to avoid duplicates
+      const { data: existingCase, error: fetchError } = await _supabase
+        .from('cases')
+        .select('id')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (fetchError) {
+        const isAuthError = fetchError.status === 401 || fetchError.status === 403 ||
+          (fetchError.message && (
+            fetchError.message.toLowerCase().includes('jwt') ||
+            fetchError.message.toLowerCase().includes('auth') ||
+            fetchError.message.toLowerCase().includes('session')
+          ));
+        if (isAuthError) await _supabase.auth.signOut();
+        return null;
+      }
+
+      if (existingCase) {
+        caseId = existingCase.id;
+      } else {
+        // No case exists — create one now with status questionnaire_complete
+        const { data: newCase, error: caseInsertError } = await _supabase
+          .from('cases')
+          .insert({ user_id: userId, status: 'questionnaire_complete' })
+          .select()
+          .single();
+
+        if (caseInsertError) {
+          console.error('[submitQuestionnaire] Failed to create case:', caseInsertError);
+          const isAuthError = caseInsertError.status === 401 || caseInsertError.status === 403 ||
+            (caseInsertError.message && (
+              caseInsertError.message.toLowerCase().includes('jwt') ||
+              caseInsertError.message.toLowerCase().includes('auth') ||
+              caseInsertError.message.toLowerCase().includes('session')
+            ));
+          if (isAuthError) await _supabase.auth.signOut();
+          return null;
+        }
+        caseId = newCase.id;
+      }
+    }
+
+    // 2️⃣ Insert questionnaire response row
     const { data, error: insertError } = await _supabase
       .from('questionnaire_responses')
       .insert({
@@ -2297,7 +2343,7 @@ const API = {
     // 3️⃣ Handle errors: treat duplicate (23505) as success; sign out only on auth/session errors
     if (insertError) {
       if (insertError.code === '23505') {
-        // Duplicate — treat as success, continue to RPC
+        // Duplicate — treat as success, continue to status update
       } else {
         const isAuthError = insertError.status === 401 || insertError.status === 403 ||
           (insertError.message && (
