@@ -2059,6 +2059,7 @@ document.querySelectorAll('.reveal').forEach(el => revealObserver.observe(el));
 // ═══════════════════════════════════════════════════════════════════
 const AppState = {
   user: null,         // { id, email, firstName, lastName, role, tier, paymentStatus, referralCode }
+  profile: null,      // raw profile row (kept in sync with user, safe fallback)
   case: null,         // { id, caseNumber, permitType, permitTypeConfirmed, status, tier, reviewCyclesUsed, createdAt }
   questionnaire: null,// { completed, aiRecommendation, userSelectedType, specialistConfirmedType }
   documents: [],      // [{ id, documentType, fileName, status }]
@@ -2130,7 +2131,7 @@ async function _fetchUserProfile(authUser) {
       .from('users')
       .select('*')
       .eq('id', authUser.id)
-      .single();
+      .maybeSingle();
     if (error || !data) return null;
     return _mapUserProfile(authUser, data);
   } catch (_) { return null; }
@@ -2164,33 +2165,51 @@ async function _fetchCase(user) {
 
 // ─── LOAD USER DATA ───
 async function _loadUserData(authUser) {
-  AppState.loading = true;
-  renderApp();
-  const profile = await _fetchUserProfile(authUser);
-  if (!profile) {
-    console.error('User profile not found or blocked by RLS');
+  try {
+    AppState.loading = true;
+    renderApp();
+    const profile = await _fetchUserProfile(authUser);
+    if (!profile) {
+      console.error('User profile not found or blocked by RLS — using safe fallback');
+      // Build a minimal safe user from auth data so the app never gets stuck
+      const emailParts = (authUser.email || '').split('@')[0].split('.');
+      AppState.user = {
+        id:            authUser.id,
+        email:         authUser.email,
+        firstName:     emailParts[0] || '',
+        lastName:      emailParts[1] || '',
+        role:          'client',
+        tier:          null,
+        paymentStatus: 'unpaid',
+        referralCode:  null,
+      };
+    } else {
+      AppState.user = profile;
+      // Ensure paymentStatus is never null
+      if (!AppState.user.paymentStatus) AppState.user.paymentStatus = 'unpaid';
+    }
+    AppState.isPaidUser = AppState.user.paymentStatus === 'paid';
+    AppState.profile = AppState.user; // keep .profile in sync for safety
+    AppState.case = await _fetchCase(AppState.user);
     AppState.loading = false;
     renderApp();
-    return;
+  } catch (err) {
+    console.error('Fatal _loadUserData error:', err);
+    AppState.loading = false;
+    renderApp();
   }
-  AppState.user = profile;
-  AppState.isPaidUser = profile.paymentStatus === 'paid';
-  AppState.case = await _fetchCase(profile);
-  AppState.loading = false;
-  renderApp();
 }
 
 // ─── AUTH INIT ───
 async function initAuth() {
-  AppState.loading = true;
-
-  // Subscribe to future auth changes
+  // Subscribe to future auth changes (register once)
   _supabase.auth.onAuthStateChange(async (event, session) => {
     if (event === 'SIGNED_IN' && session) {
       await _loadUserData(session.user);
     }
     if (event === 'SIGNED_OUT') {
       AppState.user    = null;
+      AppState.profile = null;
       AppState.case    = null;
       AppState.questionnaire = null;
       AppState.documents   = [];
@@ -2201,19 +2220,42 @@ async function initAuth() {
     }
   });
 
-  // Check for existing session
+  // Check for existing session (handles refresh / returning user)
   try {
-    const { data } = await _supabase.auth.getSession();
-    if (data && data.session) {
-      await _loadUserData(data.session.user);
-    } else {
+    AppState.loading = true;
+    renderApp();
+    const { data: { session }, error: sessionError } = await _supabase.auth.getSession();
+
+    if (sessionError) {
+      console.error('Session error:', sessionError);
+      AppState.user = null;
+      AppState.profile = null;
       AppState.loading = false;
       renderApp();
+      return;
     }
-  } catch (_) {
+
+    if (!session) {
+      AppState.user = null;
+      AppState.profile = null;
+      AppState.loading = false;
+      renderApp();
+      return;
+    }
+
+    // Session exists — load user data (onAuthStateChange SIGNED_IN may not fire on refresh)
+    await _loadUserData(session.user);
+
+  } catch (err) {
+    console.error('Fatal initAuth error:', err);
     AppState.loading = false;
     renderApp();
   }
+}
+
+// ─── INITIALIZE APP ─── (alias used by DOMContentLoaded)
+async function initializeApp() {
+  await initAuth();
 }
 
 // ─── API LAYER (Supabase-backed) ───
@@ -2314,77 +2356,107 @@ function canAccessRoute(routeName) {
   return routeName === 'client';
 }
 
+// ─── SAFE PAGE ACTIVATION HELPER ───
+function safeActivatePage(pageId) {
+  try {
+    document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+    const page = document.getElementById(pageId);
+    if (page) {
+      page.classList.add("active");
+    } else {
+      console.error("Missing page:", pageId);
+      const fallback = document.getElementById("page-landing");
+      if (fallback) fallback.classList.add("active");
+    }
+  } catch (err) {
+    console.error("Page activation failed:", err);
+  }
+}
+
 // ─── DETERMINISTIC ROUTER ───
 // Single source of truth. Derives screen from AppState.
 // No direct page mutations outside this function.
 function renderApp() {
-  const { user, case: userCase, questionnaire, videoCall, loading } = AppState;
+  try {
+    if (AppState.loading) {
+      safeActivatePage("page-landing");
+      return;
+    }
 
-  if (loading) {
-    _showRawPage('loading');
-    return;
-  }
+    if (!AppState.user) {
+      safeActivatePage("page-landing");
+      return;
+    }
 
-  // ── Unauthenticated ──
-  if (!user) {
-    document.getElementById('main-nav').style.display = 'flex';
-    _showRawPage('landing');
-    return;
-  }
+    const paymentStatus = AppState.profile?.payment_status || "unpaid";
 
-  // ── Role-based routing ──
-  document.getElementById('main-nav').style.display = 'none';
+    const { user, case: userCase, questionnaire, videoCall } = AppState;
 
-  if (user.role === 'specialist' || user.role === 'admin') {
-    _showRawPage('specialist');
-    renderSpecialistPage();
-    return;
-  }
+    // ── Role-based routing ──
+    document.getElementById('main-nav').style.display = 'none';
 
-  if (user.role === 'admin_legacy') {
-    _showRawPage('admin');
-    renderAdminDashboard('dashboard');
-    return;
-  }
+    if (user.role === 'specialist' || user.role === 'admin') {
+      safeActivatePage("page-specialist");
+      renderSpecialistPage();
+      return;
+    }
 
-  // ── Client state machine ──
-  // Gate 2: questionnaire
-  if (!questionnaire || !questionnaire.completed) {
-    _showRawPage('questionnaire');
-    return;
-  }
+    if (user.role === 'admin_legacy') {
+      safeActivatePage("page-admin");
+      renderAdminDashboard('dashboard');
+      return;
+    }
 
-  // Gate 3: confirmation call
-  if (!videoCall || videoCall.status !== 'completed') {
-    _showRawPage('book-call');
-    return;
-  }
+    // ── Client state machine ──
+    const resolvedPaymentStatus = AppState.profile?.payment_status || "unpaid";
 
-  // Gate 4: case-status-driven dashboard view
-  _showRawPage('client');
-  _hydrateClientSidebar();
+    // Gate 1: payment
+    if (resolvedPaymentStatus !== 'paid') {
+      safeActivatePage("page-plan-selection");
+      return;
+    }
 
-  const status = userCase ? userCase.status : null;
-  switch (status) {
-    case 'questionnaire_pending':
-    case 'questionnaire_complete':
-    case 'call_pending':
-      renderClientDashboard('booking');
-      break;
-    case 'call_confirmed':
-    case 'documents_pending':
-    case 'ai_checking':
-    case 'needs_revision':
-      renderClientDashboard('documents');
-      break;
-    case 'in_review':
-    case 'approved':
-    case 'submitted':
-    case 'completed':
-      renderClientDashboard('overview');
-      break;
-    default:
-      renderClientDashboard('overview');
+    // Gate 2: questionnaire
+    if (!questionnaire || !questionnaire.completed) {
+      safeActivatePage("page-questionnaire");
+      return;
+    }
+
+    // Gate 3: confirmation call
+    if (!videoCall || videoCall.status !== 'completed') {
+      safeActivatePage("page-book-call");
+      return;
+    }
+
+    // Gate 4: case-status-driven dashboard view
+    safeActivatePage("page-client");
+    _hydrateClientSidebar();
+
+    const status = userCase ? userCase.status : null;
+    switch (status) {
+      case 'questionnaire_pending':
+      case 'questionnaire_complete':
+      case 'call_pending':
+        renderClientDashboard('booking');
+        break;
+      case 'call_confirmed':
+      case 'documents_pending':
+      case 'ai_checking':
+      case 'needs_revision':
+        renderClientDashboard('documents');
+        break;
+      case 'in_review':
+      case 'approved':
+      case 'submitted':
+      case 'completed':
+        renderClientDashboard('overview');
+        break;
+      default:
+        renderClientDashboard('overview');
+    }
+  } catch (err) {
+    console.error("Render crash:", err);
+    safeActivatePage("page-landing");
   }
 }
 
@@ -3698,16 +3770,20 @@ function showToast(msg, type='success') {
 }
 
 // ─── INIT ───
-document.addEventListener('DOMContentLoaded', () => {
+window.addEventListener("load", () => {
   renderFAQ();
   lucide.createIcons();
-  initAuth(); // Session check — triggers renderApp()
+  initializeApp(); // Session check — triggers renderApp()
 });
 
 window.addEventListener('load', () => {
   document.querySelectorAll('.reveal').forEach(el => revealObserver.observe(el));
 });
 
+window.addEventListener("error", (e) => {
+  console.error("Global error caught:", e.error);
+  safeActivatePage("page-landing");
+});
+
 </script>
-</body>
 </html>
