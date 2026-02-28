@@ -2279,10 +2279,8 @@ const API = {
   fetchMessages:       async () => Promise.resolve(null),
   bookCall:            async (slotId)      => Promise.resolve(null),
   submitQuestionnaire: async (responses) => {
-    // 1️⃣ State guard — abort silently if not in questionnaire_pending
-    if (!AppState.case || AppState.case.status !== 'questionnaire_pending') {
-      await refreshCase();
-      renderApp();
+    if (!AppState.case) {
+      console.error('[submitQuestionnaire] Missing case in AppState');
       return null;
     }
     const caseId = AppState.case.id;
@@ -2591,9 +2589,6 @@ async function handleLogout() {
 
 // ─── QUESTIONNAIRE SUBMIT ───
 async function handleQuestionnaireSubmit() {
-  // 1️⃣ Client-side state guard
-  if (!AppState.case || AppState.case.status !== 'questionnaire_pending') return;
-
   const fields = {
     primary_reason:     document.getElementById('q_primary_reason')?.value    || '',
     nationality:        document.getElementById('q_nationality')?.value        || '',
@@ -2629,24 +2624,28 @@ async function handleQuestionnaireSubmit() {
   const trcRecommendation = _computeTrcRecommendation(fields);
 
   try {
-    // Allow re-editing: if case is already questionnaire_complete, skip API call and just update locally
+    // Allow re-editing: if case is already questionnaire_complete or further, skip API call and just update locally
     const caseStatus = AppState.case ? AppState.case.status : null;
+    console.log('[handleQuestionnaireSubmit] Current case status:', caseStatus);
     if (caseStatus === 'questionnaire_complete' || caseStatus === 'call_pending' ||
         caseStatus === 'call_confirmed' || caseStatus === 'documents_pending') {
       // Re-edit mode: save locally, no DB re-insert needed
       AppState.questionnaire = { completed: true, aiRecommendation: trcRecommendation };
       showToast('Questionnaire updated.', 'success');
-      renderApp();
+      safeActivatePage('page-book-call');
       return;
     }
+    console.log('[handleQuestionnaireSubmit] Calling API.submitQuestionnaire...');
     const result = await API.submitQuestionnaire(fields);
+    console.log('[handleQuestionnaireSubmit] API result:', result);
     if (!result) throw new Error('submit_failed');
     // Re-fetch case after submission
     AppState.case = await _fetchCase(AppState.user);
-    // Update local state before routing runs
+    console.log('[handleQuestionnaireSubmit] Refetched case:', AppState.case);
+    // Update local state before routing
     AppState.questionnaire = { ...AppState.questionnaire, completed: true, aiRecommendation: trcRecommendation };
     showToast('Questionnaire submitted! Here is your suggested TRC type.', 'success');
-    renderApp();
+    safeActivatePage('page-book-call');
   } catch (err) {
     console.error('[handleQuestionnaireSubmit] Submission error:', err);
     // Re-enable submit button on non-auth errors; skip if user was signed out
